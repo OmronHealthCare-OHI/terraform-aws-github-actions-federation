@@ -32,6 +32,9 @@ terraform.rc
 # dependabot can bump them. Examples are validate-only and not covered by
 # dependabot, so theirs would go stale.
 examples/**/.terraform.lock.hcl
+# The vendored module is locked by the root; CI copies the root's lock into
+# it to run its own tests.
+modules/**/.terraform.lock.hcl
 
 # Local env files
 .env

@@ -16,11 +16,6 @@ on:
 # inheriting the repository default.
 permissions: {}
 
-# Pinned, not read from .terraform-docs.yml: that holds a `>=` floor, and
-# --output-check needs one exact version. Bump alongside the constraint.
-env:
-  TERRAFORM_DOCS_VERSION: 0.20.0
-
 jobs:
   terraform:
     runs-on: ubuntu-latest
@@ -76,6 +71,24 @@ jobs:
           path: ${{inputs.terraform_directory}}/test-results.xml
           retention-days: 30
 
+      # terraform test runs only the tests/ beside the directory it is given,
+      # so the vendored permission-boundary module's own tests run from its
+      # directory. They are what shows a later upstream release, diffed in,
+      # still behaves. The module has no lock file of its own: it borrows the
+      # root's, so its tests run the provider versions the root is tested with.
+      - name: Terraform test (vendored permission-boundary module)
+        working-directory: ${{inputs.terraform_directory}}/modules/iam-policy-permission-boundary
+        run: |
+          cp ../../.terraform.lock.hcl .
+          terraform init -backend=false -input=false -no-color
+          terraform test -no-color
+
+      # scripts/create-workspace-state.sh runs only in a caller's gated apply,
+      # so its create-only rules are tested here, against a stub aws.
+      - name: Workspace-state script test
+        working-directory: ${{inputs.terraform_directory}}
+        run: tests/create-workspace-state.test.sh
+
       # After the publish steps, so a lint failure still leaves test results on
       # the PR.
       - name: Setup TFLint
@@ -105,18 +118,38 @@ jobs:
           config_file: ${{inputs.terraform_directory}}/.checkov-config.yml
 
       # The BEGIN_TF_DOCS block is the module's interface, so CI checks it
-      # rather than trusting the hook.
+      # rather than trusting the hook. It checks what the block says, not how
+      # it is laid out: terraform-docs releases often, and its versions differ
+      # in layout (0.25 writes `| ---- |` separator rows where 0.20 wrote
+      # `|------|`). So CI runs the latest release, and any version at or above
+      # .terraform-docs.yml's floor can write the block locally. A release that
+      # changes the content itself (a new column, say) still fails here, once,
+      # until the block is regenerated.
       - name: Setup terraform-docs
         uses: jaxxstorm/action-install-gh-release@v4.0.0
         with:
           repo: terraform-docs/terraform-docs
-          tag: v${{ env.TERRAFORM_DOCS_VERSION }}
-          cache: enable # the action compares this to "enable", not to a bool
+          tag: latest
 
       - name: terraform-docs is up to date
         id: tf-docs
         working-directory: ${{inputs.terraform_directory}}
-        run: terraform-docs -c .terraform-docs.yml . --output-check
+        run: |
+          # The block between the markers, without the layout: table separator
+          # rows dropped, runs of spaces (cell padding) squeezed to one.
+          normalize() {
+            sed -n '/<!-- BEGIN_TF_DOCS -->/,/<!-- END_TF_DOCS -->/p' "$1" \
+              | grep -v -E '^\|[[:space:]:|-]+\|$' \
+              | tr -s ' '
+          }
+          terraform-docs --version
+          committed="$(mktemp)"
+          cp README.md "$committed"
+          terraform-docs -c .terraform-docs.yml .
+          if ! diff -u <(normalize "$committed") <(normalize README.md); then
+            echo "::error file=README.md::The terraform-docs block is out of date: run pre-commit (or terraform-docs -c .terraform-docs.yml .) and commit README.md."
+            exit 1
+          fi
 
       # fmt and test use continue-on-error so results still publish; fail here.
       - name: Fail on format or test errors
@@ -125,6 +158,51 @@ jobs:
           echo "terraform fmt outcome:  ${{ steps.tf-fmt.outcome }}"
           echo "terraform test outcome: ${{ steps.tf-test.outcome }}"
           exit 1
+
+  # required_version is a claim; this job checks it: the tests on the oldest
+  # release the constraint admits. The floor is read from versions.tf, so
+  # raising it moves this job along. Not gha-terraform-setup's min-required:
+  # that action is internal, and a public repository can't call it.
+  min-required:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read # for actions/checkout to fetch code
+
+    defaults:
+      run:
+        working-directory: ${{inputs.terraform_directory}}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GH_TOKEN }}
+      - name: Read the floor from versions.tf
+        id: floor
+        run: |
+          floor=$(sed -n -E 's/^[[:space:]]*required_version[[:space:]]*=[[:space:]]*">=[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+)"[[:space:]]*$/\1/p' versions.tf)
+          if [ -z "$floor" ]; then
+            echo "::error file=versions.tf::required_version is not a plain \">= X.Y.Z\" floor, so this job can't tell which release to test on."
+            exit 1
+          fi
+          echo "version=$floor" >> "$GITHUB_OUTPUT"
+      - name: Setup Terraform ${{ steps.floor.outputs.version }}
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ steps.floor.outputs.version }}
+          terraform_wrapper: false
+      - name: Terraform test on ${{ steps.floor.outputs.version }}
+        run: |
+          terraform init -backend=false -input=false -no-color
+          terraform test -no-color
+      - name: Terraform test (vendored permission-boundary module) on ${{ steps.floor.outputs.version }}
+        working-directory: ${{inputs.terraform_directory}}/modules/iam-policy-permission-boundary
+        run: |
+          cp ../../.terraform.lock.hcl .
+          terraform init -backend=false -input=false -no-color
+          terraform test -no-color
 
   # Each example is its own root module, so the job above never loads them.
   examples:
