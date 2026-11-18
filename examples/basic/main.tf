@@ -43,6 +43,15 @@ module "label" {
 
 data "aws_caller_identity" "current" {}
 
+# aws-organization's shared_permission_boundaries output in practice: the
+# deploy, read and service classes. Without them the consumers' roles, and the
+# roles they create, carry no boundary. The classes must cover every
+# consumer's services (here lambda and logs).
+variable "permission_boundaries" {
+  description = "The permission-boundary classes, keyed by class name."
+  type        = any
+}
+
 module "github_actions_federation" {
   source = "../.."
 
@@ -59,4 +68,5 @@ module "github_actions_federation" {
   }
   repository_settings_owner        = "cicd"
   github_environment_reviewer_team = "cloud-foundations-in-connect-one-app"
+  permission_boundaries            = var.permission_boundaries
 }

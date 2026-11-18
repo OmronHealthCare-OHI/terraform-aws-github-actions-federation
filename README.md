@@ -31,14 +31,22 @@ module "github_actions_federation" {
 
   account_key   = "cicd"                                        # a key of github_oidc_consumers
   account_id    = data.aws_caller_identity.current.account_id
-  label_context = module.label.context                          # must carry a namespace
+  label_context = module.label.context                          # account-level: a namespace, no stage
 
   github_oidc_consumers            = var.github_oidc_consumers
   repository_settings_owner        = "cicd"                     # owns the repository-level settings
   github_environment_reviewer_team = "cloud-foundations-in-connect-one-app"
+  permission_boundaries            = var.permission_boundaries  # the deploy, read and service classes
   # state roles, bucket, workspace provisioner, GitHub App keys: see Inputs
 }
 ```
+
+**Pass `permission_boundaries`.** It defaults to empty, which renders no
+classes, and without them the consumers' roles and the roles they create under
+`/services/<repo>/` carry no boundary: a consumer that may write `lambda` could
+run a function as a role with any policy it attaches. shared-workload passes
+aws-organization's `shared_permission_boundaries` output. Making the classes
+required is a separate, breaking change.
 
 The label context comes in as `label_context`, not the `context` other OHI
 modules take, and there is no `label_context` output: the module was a local
@@ -65,9 +73,18 @@ the coverage check holds for their own roles, and they compare each class they
 read with that rendering: a class change fails their plan until the owner has
 applied it.
 
+So every workspace of an account passes the same account-level
+`label_context`, without a stage. The class policies are named from it
+(`<namespace>-<application>-<class>`), and a stage in the label would have the
+qa workspace look up `omron-eu-qa-deploy` where the dev owner created
+`omron-eu-dev-deploy`.
+
 The pipeline roles are per workspace, and their names are per account, so
 each of those workspaces also sets `stage`: its roles become
-`<repo>-<stage>-read` and `<repo>-<stage>-deploy`. With an account per stage
+`<repo>-<stage>-read` and `<repo>-<stage>-deploy`. A stage appears once per
+account: two regions of one stage in one account would claim the same role
+names, so each region of a stage needs its own account (as Connect One has,
+with nonprd/eu and nonprd/us). With an account per stage
 the account id already tells the stages apart, so `stage` stays unset and the
 names stay `<repo>-read` and `<repo>-deploy`. The account's owner sets `stage`
 too: the baseline boundary it renders then covers every stage's baseline deploy

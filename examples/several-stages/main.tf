@@ -41,15 +41,27 @@ provider "github" {
   owner = "OmronHealthCare-OHI"
 }
 
+# Account-level, the same in every workspace of the account: no stage. The
+# permission-boundary classes are named from it (omron-connect-<class>), and
+# the qa workspace looks up the policies the dev owner created by that name.
 module "label" {
   source = "github.com/OmronHealthCare-OHI/terraform-null-label?ref=1.0.0"
 
-  namespace = "omron"
-  region    = "eu"
-  stage     = var.stage
+  namespace   = "omron"
+  application = "connect"
+  aws_region  = "eu-central-1" # tag only; not part of the id
 }
 
 data "aws_caller_identity" "current" {}
+
+# aws-organization's shared_permission_boundaries output in practice: the
+# deploy, read and service classes. Without them the consumers' roles, and the
+# roles they create, carry no boundary. The classes must cover every
+# consumer's services (here lambda and logs).
+variable "permission_boundaries" {
+  description = "The permission-boundary classes, keyed by class name."
+  type        = any
+}
 
 module "github_actions_federation" {
   source = "../.."
@@ -72,4 +84,5 @@ module "github_actions_federation" {
   }
   repository_settings_owner        = "dev-eu"
   github_environment_reviewer_team = "cloud-foundations-in-connect-one-app"
+  permission_boundaries            = var.permission_boundaries
 }
