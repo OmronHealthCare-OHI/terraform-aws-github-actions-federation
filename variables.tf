@@ -567,12 +567,14 @@ variable "permission_boundaries" {
     named <namespace>-<application>-<class> from the label (omron-shared-deploy,
     …), the same name in every account of that application, so an Identity
     Center permission set can reference the users class by name and path.
-    Empty (the default) renders none.
 
-    When set, it must carry the classes the federation's roles use (deploy,
-    read and service), and those must cover every consumer's services in every
-    account: deploy <svc>:*, read <svc>:Get*, List* and Describe*. A consumer
-    that adds a service needs it in aws-organization's classes first.
+    Required, with at least the classes the federation's roles use (deploy,
+    read and service): without them the consumers' roles, and the roles they
+    create under /services/<repo>/, would carry no boundary, so a consumer
+    could run a service as a role with any policy it attaches. They must cover
+    every consumer's services in every account: deploy <svc>:*, read <svc>:Get*,
+    List* and Describe*. A consumer that adds a service needs it in
+    aws-organization's classes first.
   EOT
   type = map(object({
     allow_all                 = optional(bool, false)
@@ -582,11 +584,10 @@ variable "permission_boundaries" {
     permit_human_user_actions = optional(bool, false)
     permit_org_governance     = optional(bool, false)
   }))
-  default  = {}
   nullable = false
 
   validation {
-    condition     = length(var.permission_boundaries) == 0 || length(setsubtract(["deploy", "read", "service"], keys(var.permission_boundaries))) == 0
+    condition     = length(setsubtract(["deploy", "read", "service"], keys(var.permission_boundaries))) == 0
     error_message = "permission_boundaries must carry the deploy, read and service classes (missing: ${join(", ", setsubtract(["deploy", "read", "service"], keys(var.permission_boundaries)))}): the consumers' deploy and read roles and the roles they create under /services/<repo>/ are bounded by them."
   }
 
