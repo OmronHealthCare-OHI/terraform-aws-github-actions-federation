@@ -71,7 +71,10 @@ fails until the owner has applied, and fails if the provider doesn't accept the
 `sts.amazonaws.com` audience the roles trust. They still render the classes, so
 the coverage check holds for their own roles, and they compare each class they
 read with that rendering: a class change fails their plan until the owner has
-applied it.
+applied it. The same holds for `<repo>-baseline`, which every stage's baseline
+deploy role carries: declare the baseline repository the same way (its
+`services`, `manages_github`) in every workspace of the account, or the stages
+that differ from the owner fail their plan.
 
 So every workspace of an account passes the same account-level
 `label_context`, without a stage. The class policies are named from it
