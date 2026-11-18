@@ -249,6 +249,19 @@ variable "github_oidc_consumers" {
     error_message = "Two github_oidc_consumers account keys give the same <ACCOUNT>_READ_ROLE_ARN name once upper-cased with \"-\" as \"_\" (foo-bar and foo_bar). Rename one."
   }
 
+  # And that name must be one GitHub accepts: letters, digits and "_", not
+  # starting with a digit or with GITHUB_ (checked on the whole name: the key
+  # github alone becomes GITHUB_READ_ROLE_ARN). GitHub refuses anything else only
+  # when the variable is written, part-way through an apply that has already
+  # changed the roles. dev.eu, 1-dev and github all pass the check above.
+  validation {
+    condition = alltrue([
+      for account in keys(var.github_oidc_consumers) :
+      can(regex("^[A-Z_][A-Z0-9_]*$", upper(replace(account, "-", "_")))) && !startswith("${upper(replace(account, "-", "_"))}_READ_ROLE_ARN", "GITHUB_")
+    ])
+    error_message = "Each github_oidc_consumers account key names a GitHub Actions variable, <ACCOUNT>_READ_ROLE_ARN (upper-cased, \"-\" as \"_\"), so it may hold only letters, digits, \"-\" and \"_\", may not start with a digit, and may not be github or start with github- or github_ (GitHub reserves the GITHUB_ prefix). Rejected: ${join(", ", sort([for account in keys(var.github_oidc_consumers) : account if !(can(regex("^[A-Z_][A-Z0-9_]*$", upper(replace(account, "-", "_")))) && !startswith("${upper(replace(account, "-", "_"))}_READ_ROLE_ARN", "GITHUB_"))]))}."
+  }
+
   # A repository's Environment holds that account's DEPLOY_ROLE_ARN and
   # TF_STATE_ROLE_ARN, and the account's deploy role trusts it. The same
   # Environment for one repository in two accounts would have two workspaces
