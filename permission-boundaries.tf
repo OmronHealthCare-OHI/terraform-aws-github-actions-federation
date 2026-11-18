@@ -114,7 +114,7 @@ locals {
 # (aws-organization adds a service, a consumer starts using it) would
 # otherwise pass and then fail closed, with AccessDenied, until the owner
 # applies. Compared as decoded JSON, so key order and whitespace don't count.
-# The baseline's own boundary isn't compared: only its owner renders it.
+# The baseline's own boundary is compared the same way, below.
 data "aws_iam_policy" "class_boundary" {
   for_each = var.manage_account_resources ? toset([]) : toset(keys(var.permission_boundaries))
 
@@ -128,10 +128,25 @@ data "aws_iam_policy" "class_boundary" {
   }
 }
 
+# The baseline's boundary is rendered from the baseline repository's consumer
+# entry (its services, manages_github), the stage and the account's roles.
+# Only the owner applies it, but every stage's baseline deploy role carries
+# it, so this workspace renders it too and requires the owner's to be the
+# same. A stage whose baseline entry differs from the owner's (a service only
+# it declares) would otherwise plan cleanly and fail with AccessDenied at
+# apply. Declare the baseline repository the same way in every workspace of
+# the account, and apply a change on the owner first.
 data "aws_iam_policy" "baseline_boundary" {
   count = !var.manage_account_resources && local.boundaries_enabled ? 1 : 0
 
   arn = local.baseline_boundary_arn
+
+  lifecycle {
+    postcondition {
+      condition     = jsondecode(self.policy) == jsondecode(data.aws_iam_policy_document.baseline_boundary[0].json)
+      error_message = "The owner's ${local.baseline_boundary_name} in account ${var.account_id} differs from the one this workspace renders, so this workspace's ${local.baseline_repository} deploy role would carry a boundary that doesn't fit it. Declare ${local.baseline_repository} the same way (services, manages_github) in every workspace of the account, and apply the change on the owner workspace (manage_account_resources = true) first."
+    }
+  }
 }
 
 # With a stage, the baseline boundary denies changing the boundary of
@@ -218,7 +233,9 @@ resource "terraform_data" "stage_baseline_prefix" {
 # GitHub Environment (decided on PR #56, 2026-11-09).
 
 data "aws_iam_policy_document" "baseline_boundary" {
-  count = var.manage_account_resources && local.boundaries_enabled ? 1 : 0
+  # Rendered without manage_account_resources too, to compare with the
+  # owner's (data.aws_iam_policy.baseline_boundary).
+  count = local.boundaries_enabled ? 1 : 0
 
   #checkov:skip=CKV_AWS_107: A boundary caps; it grants nothing. The App-key read is on the one apply secret.
   #checkov:skip=CKV_AWS_108: A boundary caps; it grants nothing. Reads are IAM's and the one apply secret.
