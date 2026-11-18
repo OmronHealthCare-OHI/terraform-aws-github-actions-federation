@@ -126,6 +126,15 @@ variables {
   account_key = "cicd"
   account_id  = "123456789012"
 
+  # Required: the classes every run plans with unless it sets its own.
+  # allow_all keeps them out of the way of what a run tests; the classes'
+  # content and coverage are tested in the boundary runs further down.
+  permission_boundaries = {
+    deploy  = { allow_all = true, permit_policy_mutation = true }
+    read    = { allow_all = true }
+    service = { allowed_actions = ["s3:GetObject"] }
+  }
+
   # shared-workload's account label: omron-shared-cicd.
   label_context = {
     namespace          = "omron"
@@ -1292,6 +1301,35 @@ run "a_wildcard_github_app_key_secret_is_rejected" {
 run "github_variables_are_managed_from_the_settings" {
   command = apply
 
+  # The classes are required (CLF-144), but this run is not about them. Left
+  # to the mock, an apply would create the class policies, and the mock gives
+  # their id, name_prefix and policy_id new values between plan and apply,
+  # which Terraform refuses as an inconsistent final plan. One class that
+  # allows everything stands in for each; the boundary runs test the real
+  # ones with command = plan.
+  override_module {
+    target = module.permission_boundary
+    outputs = {
+      policy_arn           = "arn:aws:iam::123456789012:policy/boundaries/omron-shared-class"
+      policy_name          = "omron-shared-class"
+      policy_path          = "/boundaries/"
+      policy_document_json = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}]}"
+      policy_statements    = [{ sid = "allowAll", effect = "Allow", actions = ["*"], resources = ["*"] }]
+    }
+  }
+
+  # The baseline's own boundary, the same way.
+  override_resource {
+    target          = aws_iam_policy.baseline_boundary
+    override_during = plan
+    values = {
+      arn         = "arn:aws:iam::123456789012:policy/boundaries/shared-workload-baseline"
+      id          = "arn:aws:iam::123456789012:policy/boundaries/shared-workload-baseline"
+      name_prefix = ""
+      policy_id   = "ANPAMOCKEDBASELINE0000"
+    }
+  }
+
   # An apply would run the workspace-creation script for real (see the
   # file-level variables): without the provisioner nothing is created, and
   # the check that says so is expected.
@@ -1792,6 +1830,35 @@ run "the_declared_workspaces_are_published_and_planned" {
 run "a_declared_workspace_is_recorded" {
   command = apply
 
+  # The classes are required (CLF-144), but this run is not about them. Left
+  # to the mock, an apply would create the class policies, and the mock gives
+  # their id, name_prefix and policy_id new values between plan and apply,
+  # which Terraform refuses as an inconsistent final plan. One class that
+  # allows everything stands in for each; the boundary runs test the real
+  # ones with command = plan.
+  override_module {
+    target = module.permission_boundary
+    outputs = {
+      policy_arn           = "arn:aws:iam::123456789012:policy/boundaries/omron-shared-class"
+      policy_name          = "omron-shared-class"
+      policy_path          = "/boundaries/"
+      policy_document_json = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}]}"
+      policy_statements    = [{ sid = "allowAll", effect = "Allow", actions = ["*"], resources = ["*"] }]
+    }
+  }
+
+  # The baseline's own boundary, the same way.
+  override_resource {
+    target          = aws_iam_policy.baseline_boundary
+    override_during = plan
+    values = {
+      arn         = "arn:aws:iam::123456789012:policy/boundaries/shared-workload-baseline"
+      id          = "arn:aws:iam::123456789012:policy/boundaries/shared-workload-baseline"
+      name_prefix = ""
+      policy_id   = "ANPAMOCKEDBASELINE0000"
+    }
+  }
+
   variables {
     create_workspace_states = false
     github_oidc_consumers = {
@@ -1810,6 +1877,35 @@ run "a_declared_workspace_is_recorded" {
 
 run "removing_a_declared_workspace_only_drops_its_record" {
   command = apply
+
+  # The classes are required (CLF-144), but this run is not about them. Left
+  # to the mock, an apply would create the class policies, and the mock gives
+  # their id, name_prefix and policy_id new values between plan and apply,
+  # which Terraform refuses as an inconsistent final plan. One class that
+  # allows everything stands in for each; the boundary runs test the real
+  # ones with command = plan.
+  override_module {
+    target = module.permission_boundary
+    outputs = {
+      policy_arn           = "arn:aws:iam::123456789012:policy/boundaries/omron-shared-class"
+      policy_name          = "omron-shared-class"
+      policy_path          = "/boundaries/"
+      policy_document_json = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}]}"
+      policy_statements    = [{ sid = "allowAll", effect = "Allow", actions = ["*"], resources = ["*"] }]
+    }
+  }
+
+  # The baseline's own boundary, the same way.
+  override_resource {
+    target          = aws_iam_policy.baseline_boundary
+    override_during = plan
+    values = {
+      arn         = "arn:aws:iam::123456789012:policy/boundaries/shared-workload-baseline"
+      id          = "arn:aws:iam::123456789012:policy/boundaries/shared-workload-baseline"
+      name_prefix = ""
+      policy_id   = "ANPAMOCKEDBASELINE0000"
+    }
+  }
 
   variables {
     create_workspace_states = false
@@ -1898,13 +1994,16 @@ run "a_reviewer_team_display_name_on_a_consumer_is_rejected" {
 # module's, tested in its own directory; here the classes are counted, keyed
 # and checked against the consumers.
 
-run "without_classes_no_boundary_is_rendered" {
+# No classes is no longer a way to run: every role would be unbounded
+# (CLF-144).
+run "empty_permission_boundaries_are_rejected" {
   command = plan
 
-  assert {
-    condition     = length(output.permission_boundary_arns) == 0
-    error_message = "With no permission_boundaries (the default), no boundary policy is rendered."
+  variables {
+    permission_boundaries = {}
   }
+
+  expect_failures = [var.permission_boundaries]
 }
 
 # The classes cover everything the roles' own policies grant, services and the
@@ -2105,26 +2204,6 @@ override_resource {
   target          = aws_iam_policy.baseline_boundary
   override_during = plan
   values          = { arn = "arn:aws:iam::123456789012:policy/boundaries/shared-workload-baseline" }
-}
-
-run "without_classes_no_role_carries_a_boundary" {
-  command = plan
-
-  assert {
-    condition = alltrue(concat(
-      [for role in aws_iam_role.cicd_deploy : role.permissions_boundary == null],
-      [for role in aws_iam_role.cicd_read : role.permissions_boundary == null],
-    )) && length(aws_iam_policy.baseline_boundary) == 0
-    error_message = "With no classes given, no role carries a boundary and no baseline boundary is rendered."
-  }
-
-  assert {
-    condition = alltrue([
-      for s in data.aws_iam_policy_document.cicd_deploy_permissions["shared-cicd-infrastructure"].statement :
-      length(s.condition) == 0 if s.sid == "iamCreateOwnedRole"
-    ])
-    error_message = "With no classes given, iam:CreateRole carries no boundary condition."
-  }
 }
 
 run "with_classes_every_role_carries_its_boundary" {
@@ -2370,24 +2449,6 @@ run "without_account_resources_nothing_account_wide_is_created" {
   assert {
     condition     = length(terraform_data.permission_boundary_coverage) == 1
     error_message = "Without manage_account_resources, the classes are still rendered, so the coverage check still holds for this workspace's roles."
-  }
-}
-
-run "without_account_resources_or_classes_no_boundary_is_read" {
-  command = plan
-
-  variables {
-    manage_account_resources = false
-  }
-
-  assert {
-    condition     = length(data.aws_iam_policy.class_boundary) == 0 && length(data.aws_iam_policy.baseline_boundary) == 0
-    error_message = "Without classes, no boundary policy is read either."
-  }
-
-  assert {
-    condition     = length(data.aws_iam_openid_connect_provider.github) == 1
-    error_message = "Without manage_account_resources, the provider is read even without classes."
   }
 }
 
