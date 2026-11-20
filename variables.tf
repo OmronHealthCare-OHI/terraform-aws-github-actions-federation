@@ -136,7 +136,9 @@ variable "github_oidc_consumers" {
                                 (<svc>:*) and the read role may read. Not iam or
                                 sts: IAM access is the fixed split in the role
                                 files, never a service wildcard.
-      environment               The GitHub Environment the deploy role trusts.
+      environment               The GitHub Environment the deploy role trusts:
+                                no ":" or "%" (they would let two Environments
+                                share one trusted subject).
                                 Defaults to the account key, so a repository that
                                 deploys to several shared accounts has one
                                 Environment, and one DEPLOY_ROLE_ARN, per account.
@@ -335,6 +337,23 @@ variable "github_oidc_consumers" {
       ]
     ]))
     error_message = "Every environments key must be letters, digits, . _ - only, and <repo>[-<stage>]-<environment>-deploy at most 64 characters (IAM's role-name limit)."
+  }
+
+  # The Environment a single deploy role trusts (environment, or the account
+  # key it defaults to) may not hold ":" or "%". (An environments key is
+  # narrower already, above.) Other characters, a space included, are fine:
+  # the subject carries them as they are. GitHub writes a ":" in the name as %3A in the token's subject and leaves
+  # "%" alone, so production:v2 and production%3Av2 would be one subject: a
+  # workflow could take the deploy role through the other Environment, which
+  # has none of this one's protection.
+  validation {
+    condition = alltrue(flatten([
+      for account, consumers in var.github_oidc_consumers : [
+        for repo, consumer in consumers :
+        consumer.environments != null ? true : !can(regex("[:%]", consumer.environment == null ? account : consumer.environment))
+      ]
+    ]))
+    error_message = "Every Environment a deploy role trusts (a consumer's environment, or the account key it defaults to) may not hold \":\" or \"%\": either would let two Environments share one trusted subject. Rejected (account/repository: Environment): ${join(", ", sort(flatten([for account, consumers in var.github_oidc_consumers : [for repo, consumer in consumers : "${account}/${repo}: ${consumer.environment == null ? account : consumer.environment}" if consumer.environments == null && can(regex("[:%]", consumer.environment == null ? account : consumer.environment))]])))}."
   }
 
   # Every deploy role in an account needs a name of its own. A staged

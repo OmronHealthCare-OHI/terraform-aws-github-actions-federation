@@ -77,14 +77,13 @@ locals {
     )
   ]...)
 
-  # GitHub writes any ":" inside a context value as %3A in the sub claim
-  # (an Environment named production:v2 arrives as environment:production%3Av2),
-  # so the trust must carry the encoded form or no token ever matches. The
-  # Environment's own name, as configured in GitHub, stays raw in
-  # github_actions_settings.
+  # An Environment name holds no ":" and no "%" (variables.tf), so it appears
+  # in the sub claim exactly as configured. GitHub would write a ":" as %3A
+  # and leave "%" alone, which let production:v2 and production%3Av2 share one
+  # subject; both are rejected instead of encoded.
   github_oidc_deploy_subject = {
     for key, unit in local.github_oidc_deploy_units :
-    key => "${local.github_oidc_subject_prefix[unit.repository]}:environment:${replace(unit.environment, ":", "%3A")}"
+    key => "${local.github_oidc_subject_prefix[unit.repository]}:environment:${unit.environment}"
   }
 
   # Split per resource type so no statement grants an action on a resource it
