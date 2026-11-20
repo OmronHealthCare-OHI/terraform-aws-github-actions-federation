@@ -196,6 +196,15 @@ data "aws_iam_policy_document" "cicd_deploy_assume_role" {
 resource "aws_iam_role" "cicd_deploy" {
   for_each = local.github_oidc_deploy_units
 
+  # The trust names an Environment, and a workflow that names a missing one
+  # makes GitHub create it with no protection rules. So the role, and with it
+  # every policy attached to it, is created only once its Environment exists
+  # with the main-only deployment policy (github-environments.tf). Otherwise a
+  # first apply could create them in parallel, and in that window a workflow
+  # on any branch could take the role. All Environments, not only this role's:
+  # depends_on can't name one instance, and a reference would change the role.
+  depends_on = [github_repository_environment_deployment_policy.main]
+
   name               = each.value.role_name
   path               = "/${var.cicd_roles_path}/${var.github_oidc_path}/"
   description        = "GitHub Actions deploy role for ${var.github_organization}/${each.value.repository}: applies through the ${each.value.environment} Environment."
