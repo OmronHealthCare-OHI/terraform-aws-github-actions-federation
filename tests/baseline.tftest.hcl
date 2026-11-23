@@ -413,6 +413,66 @@ run "account_keys_that_name_the_same_read_role_variable_are_rejected" {
   expect_failures = [var.github_oidc_consumers]
 }
 
+# Each account key names <ACCOUNT>_READ_ROLE_ARN, and GitHub refuses a
+# variable name with anything but letters, digits and "_", one starting with a
+# digit, or one starting with GITHUB_. One run per rule.
+run "an_account_key_with_a_dot_is_rejected" {
+  command = plan
+
+  variables {
+    github_oidc_consumers = {
+      cicd     = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+      "dev.eu" = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+    }
+  }
+
+  expect_failures = [var.github_oidc_consumers]
+}
+
+run "an_account_key_starting_with_a_digit_is_rejected" {
+  command = plan
+
+  variables {
+    github_oidc_consumers = {
+      cicd    = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+      "1-dev" = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+    }
+  }
+
+  expect_failures = [var.github_oidc_consumers]
+}
+
+run "an_account_key_github_is_rejected" {
+  command = plan
+
+  variables {
+    github_oidc_consumers = {
+      cicd   = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+      github = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+    }
+  }
+
+  expect_failures = [var.github_oidc_consumers]
+}
+
+# The stage-and-region keys connect-one-workload uses pass.
+run "stage_and_region_account_keys_are_accepted" {
+  command = plan
+
+  variables {
+    github_oidc_consumers = {
+      cicd     = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+      "dev-eu" = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+      prd_us   = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+    }
+  }
+
+  assert {
+    condition     = contains(keys(output.github_actions_settings["shared-workload"].repository_variables), "CICD_READ_ROLE_ARN")
+    error_message = "The cicd workspace still publishes its read role's variable."
+  }
+}
+
 run "the_same_environment_in_two_accounts_is_rejected" {
   command = plan
 
