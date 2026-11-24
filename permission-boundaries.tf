@@ -114,7 +114,7 @@ locals {
 # (aws-organization adds a service, a consumer starts using it) would
 # otherwise pass and then fail closed, with AccessDenied, until the owner
 # applies. Compared as decoded JSON, so key order and whitespace don't count.
-# The baseline's own boundary isn't compared: only its owner renders it.
+# The baseline's own boundary is compared the same way, below.
 data "aws_iam_policy" "class_boundary" {
   for_each = var.manage_account_resources ? toset([]) : toset(keys(var.permission_boundaries))
 
@@ -128,10 +128,28 @@ data "aws_iam_policy" "class_boundary" {
   }
 }
 
+# The baseline's boundary is rendered from the baseline repository's consumer
+# entry (its services, manages_github), github_app_key_arns, state_role_arn,
+# workspace_provisioner_role_arn, label_context, cicd_roles_path,
+# github_oidc_path, and whether stage is set (not its value). Only the owner
+# applies it, but every stage's baseline deploy role carries it, so this
+# workspace renders it too and requires the owner's to be the same. A stage
+# whose inputs differ from the owner's (a service only it declares) would
+# otherwise plan cleanly and fail with AccessDenied at apply. Pass those
+# inputs the same way in every workspace of the account, and apply a change
+# on the owner first. Inputs that may differ per workspace, such as stage's
+# value, the other consumers and repository_settings_owner, don't reach it.
 data "aws_iam_policy" "baseline_boundary" {
   count = !var.manage_account_resources && local.boundaries_enabled ? 1 : 0
 
   arn = local.baseline_boundary_arn
+
+  lifecycle {
+    postcondition {
+      condition     = jsondecode(self.policy) == jsondecode(data.aws_iam_policy_document.baseline_boundary[0].json)
+      error_message = "The owner's ${local.baseline_boundary_name} in account ${var.account_id} differs from the one this workspace renders, so this workspace's ${local.baseline_repository} deploy role would carry a boundary that doesn't fit it. Pass the inputs it is rendered from the same way in every workspace of the account: ${local.baseline_repository}'s services and manages_github, github_app_key_arns, state_role_arn, workspace_provisioner_role_arn, label_context, cicd_roles_path, github_oidc_path, and stage set or unset. Then apply the change on the owner workspace (manage_account_resources = true) first."
+    }
+  }
 }
 
 # With a stage, the baseline boundary denies changing the boundary of
@@ -218,7 +236,9 @@ resource "terraform_data" "stage_baseline_prefix" {
 # GitHub Environment (decided on PR #56, 2026-11-09).
 
 data "aws_iam_policy_document" "baseline_boundary" {
-  count = var.manage_account_resources && local.boundaries_enabled ? 1 : 0
+  # Rendered without manage_account_resources too, to compare with the
+  # owner's (data.aws_iam_policy.baseline_boundary).
+  count = local.boundaries_enabled ? 1 : 0
 
   #checkov:skip=CKV_AWS_107: A boundary caps; it grants nothing. The App-key read is on the one apply secret.
   #checkov:skip=CKV_AWS_108: A boundary caps; it grants nothing. Reads are IAM's and the one apply secret.

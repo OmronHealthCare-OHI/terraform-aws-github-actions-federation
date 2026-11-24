@@ -404,6 +404,66 @@ run "account_keys_that_name_the_same_read_role_variable_are_rejected" {
   expect_failures = [var.github_oidc_consumers]
 }
 
+# Each account key names <ACCOUNT>_READ_ROLE_ARN, and GitHub refuses a
+# variable name with anything but letters, digits and "_", one starting with a
+# digit, or one starting with GITHUB_. One run per rule.
+run "an_account_key_with_a_dot_is_rejected" {
+  command = plan
+
+  variables {
+    github_oidc_consumers = {
+      cicd     = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+      "dev.eu" = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+    }
+  }
+
+  expect_failures = [var.github_oidc_consumers]
+}
+
+run "an_account_key_starting_with_a_digit_is_rejected" {
+  command = plan
+
+  variables {
+    github_oidc_consumers = {
+      cicd    = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+      "1-dev" = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+    }
+  }
+
+  expect_failures = [var.github_oidc_consumers]
+}
+
+run "an_account_key_github_is_rejected" {
+  command = plan
+
+  variables {
+    github_oidc_consumers = {
+      cicd   = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+      github = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+    }
+  }
+
+  expect_failures = [var.github_oidc_consumers]
+}
+
+# The stage-and-region keys connect-one-workload uses pass.
+run "stage_and_region_account_keys_are_accepted" {
+  command = plan
+
+  variables {
+    github_oidc_consumers = {
+      cicd     = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+      "dev-eu" = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+      prd_us   = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+    }
+  }
+
+  assert {
+    condition     = contains(keys(output.github_actions_settings["shared-workload"].repository_variables), "CICD_READ_ROLE_ARN")
+    error_message = "The cicd workspace still publishes its read role's variable."
+  }
+}
+
 run "the_same_environment_in_two_accounts_is_rejected" {
   command = plan
 
@@ -2765,6 +2825,13 @@ run "a_stage_without_account_resources_rejects_an_owner_boundary_without_the_pat
     values = { policy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"denyChangingOwnBoundary\",\"Effect\":\"Deny\",\"Action\":[\"iam:PutRolePermissionsBoundary\",\"iam:DeleteRolePermissionsBoundary\"],\"Resource\":\"arn:aws:iam::123456789012:role/cicd/gha/shared-workload-deploy\"}]}" }
   }
 
+  # This workspace's rendering stands in for the same document, so only the
+  # pattern check fails, not the comparison with the owner's.
+  override_data {
+    target = data.aws_iam_policy_document.baseline_boundary
+    values = { json = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"denyChangingOwnBoundary\",\"Effect\":\"Deny\",\"Action\":[\"iam:PutRolePermissionsBoundary\",\"iam:DeleteRolePermissionsBoundary\"],\"Resource\":\"arn:aws:iam::123456789012:role/cicd/gha/shared-workload-deploy\"}]}" }
+  }
+
   expect_failures = [terraform_data.stage_baseline_prefix]
 }
 
@@ -2788,10 +2855,45 @@ run "a_stage_without_account_resources_accepts_an_owner_boundary_with_the_patter
     values = { policy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"denyChangingOwnBoundary\",\"Effect\":\"Deny\",\"Action\":[\"iam:PutRolePermissionsBoundary\",\"iam:DeleteRolePermissionsBoundary\"],\"Resource\":[\"arn:aws:iam::123456789012:role/cicd/gha/shared-workload-deploy\",\"arn:aws:iam::123456789012:role/cicd/gha/shared-workload-*-deploy\"]}]}" }
   }
 
+  # And this workspace renders the same document.
+  override_data {
+    target = data.aws_iam_policy_document.baseline_boundary
+    values = { json = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"denyChangingOwnBoundary\",\"Effect\":\"Deny\",\"Action\":[\"iam:PutRolePermissionsBoundary\",\"iam:DeleteRolePermissionsBoundary\"],\"Resource\":[\"arn:aws:iam::123456789012:role/cicd/gha/shared-workload-deploy\",\"arn:aws:iam::123456789012:role/cicd/gha/shared-workload-*-deploy\"]}]}" }
+  }
+
   assert {
     condition     = aws_iam_role.cicd_deploy["shared-workload"].name == "shared-workload-qa-deploy" && aws_iam_role.cicd_deploy["shared-workload"].permissions_boundary == "arn:aws:iam::123456789012:policy/boundaries/shared-workload-baseline"
     error_message = "This stage's baseline deploy role carries the owner's baseline boundary."
   }
+}
+
+# A stage whose baseline entry differs from the owner's: here a service only
+# this workspace declares, so its rendering of the baseline boundary isn't the
+# policy the owner applied. Its baseline deploy role would carry a boundary
+# that doesn't allow that service. Review on #2 (CLF-146).
+run "a_stage_without_account_resources_rejects_an_owner_baseline_boundary_that_differs" {
+  command = plan
+
+  variables {
+    stage                    = "qa"
+    manage_account_resources = false
+    permission_boundaries = {
+      deploy  = { allow_all = true, permit_policy_mutation = true }
+      read    = { allow_all = true }
+      service = { allowed_actions = ["s3:GetObject"], denied_actions = ["sts:AssumeRole"] }
+      users   = { allow_all = true, denied_actions = ["iam:PassRole"] }
+    }
+  }
+
+  # The owner's policy: rendered without the logs service this workspace's
+  # baseline entry declares. The mocked rendering here is the provider's
+  # default document, so any other policy stands for that difference.
+  override_data {
+    target = data.aws_iam_policy.baseline_boundary
+    values = { policy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"denyChangingOwnBoundary\",\"Effect\":\"Deny\",\"Action\":[\"iam:PutRolePermissionsBoundary\",\"iam:DeleteRolePermissionsBoundary\"],\"Resource\":[\"arn:aws:iam::123456789012:role/cicd/gha/shared-workload-deploy\",\"arn:aws:iam::123456789012:role/cicd/gha/shared-workload-*-deploy\"]}]}" }
+  }
+
+  expect_failures = [data.aws_iam_policy.baseline_boundary]
 }
 
 run "a_stage_that_pushes_a_role_name_past_64_characters_is_rejected" {
