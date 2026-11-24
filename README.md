@@ -72,9 +72,13 @@ fails until the owner has applied, and fails if the provider doesn't accept the
 the coverage check holds for their own roles, and they compare each class they
 read with that rendering: a class change fails their plan until the owner has
 applied it. The same holds for `<repo>-baseline`, which every stage's baseline
-deploy role carries: declare the baseline repository the same way (its
-`services`, `manages_github`) in every workspace of the account, or the stages
-that differ from the owner fail their plan.
+deploy role carries. It is rendered from the baseline repository's `services`
+and `manages_github`, `github_app_key_arns`, `state_role_arn`,
+`workspace_provisioner_role_arn`, `label_context`, `cicd_roles_path`,
+`github_oidc_path`, and whether `stage` is set: pass those the same way in
+every workspace of the account, or the stages that differ from the owner fail
+their plan. `stage`'s value, the other consumers and
+`repository_settings_owner` may differ; they don't reach it.
 
 So every workspace of an account passes the same account-level
 `label_context`, without a stage. The class policies are named from it

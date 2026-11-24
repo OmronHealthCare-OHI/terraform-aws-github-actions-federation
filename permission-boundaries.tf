@@ -129,13 +129,16 @@ data "aws_iam_policy" "class_boundary" {
 }
 
 # The baseline's boundary is rendered from the baseline repository's consumer
-# entry (its services, manages_github), the stage and the account's roles.
-# Only the owner applies it, but every stage's baseline deploy role carries
-# it, so this workspace renders it too and requires the owner's to be the
-# same. A stage whose baseline entry differs from the owner's (a service only
-# it declares) would otherwise plan cleanly and fail with AccessDenied at
-# apply. Declare the baseline repository the same way in every workspace of
-# the account, and apply a change on the owner first.
+# entry (its services, manages_github), github_app_key_arns, state_role_arn,
+# workspace_provisioner_role_arn, label_context, cicd_roles_path,
+# github_oidc_path, and whether stage is set (not its value). Only the owner
+# applies it, but every stage's baseline deploy role carries it, so this
+# workspace renders it too and requires the owner's to be the same. A stage
+# whose inputs differ from the owner's (a service only it declares) would
+# otherwise plan cleanly and fail with AccessDenied at apply. Pass those
+# inputs the same way in every workspace of the account, and apply a change
+# on the owner first. Inputs that may differ per workspace, such as stage's
+# value, the other consumers and repository_settings_owner, don't reach it.
 data "aws_iam_policy" "baseline_boundary" {
   count = !var.manage_account_resources && local.boundaries_enabled ? 1 : 0
 
@@ -144,7 +147,7 @@ data "aws_iam_policy" "baseline_boundary" {
   lifecycle {
     postcondition {
       condition     = jsondecode(self.policy) == jsondecode(data.aws_iam_policy_document.baseline_boundary[0].json)
-      error_message = "The owner's ${local.baseline_boundary_name} in account ${var.account_id} differs from the one this workspace renders, so this workspace's ${local.baseline_repository} deploy role would carry a boundary that doesn't fit it. Declare ${local.baseline_repository} the same way (services, manages_github) in every workspace of the account, and apply the change on the owner workspace (manage_account_resources = true) first."
+      error_message = "The owner's ${local.baseline_boundary_name} in account ${var.account_id} differs from the one this workspace renders, so this workspace's ${local.baseline_repository} deploy role would carry a boundary that doesn't fit it. Pass the inputs it is rendered from the same way in every workspace of the account: ${local.baseline_repository}'s services and manages_github, github_app_key_arns, state_role_arn, workspace_provisioner_role_arn, label_context, cicd_roles_path, github_oidc_path, and stage set or unset. Then apply the change on the owner workspace (manage_account_resources = true) first."
     }
   }
 }
