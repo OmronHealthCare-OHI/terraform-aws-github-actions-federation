@@ -177,6 +177,25 @@ variable "github_oidc_consumers" {
                                 repository's Environments require, and which
                                 gets access to it (github-team-access.tf).
                                 Defaults to github_environment_reviewer_team.
+      plan_parameter_paths      The SSM parameter paths whose values this
+                                repository's read role may read (a plan
+                                refreshing an aws_ssm_parameter decrypts it).
+                                IAM patterns starting with "/", "*" only at the
+                                end. Defaults to none, like plan_object_buckets;
+                                AWS's public /aws/service/* is always readable.
+                                Only a subtree ("<path>/*") also opens
+                                GetParametersByPath, on <path> and below: an
+                                exact path never does, since a recursive call on
+                                it would return everything under it. Every
+                                other parameter's value is denied
+                                (github-oidc-role-read.tf, CLF-145).
+      plan_object_buckets       The S3 buckets whose objects this repository's
+                                read role may read (a plan refreshing an
+                                aws_s3_object needs s3:GetObject), by name.
+                                Defaults to none: every other object is denied.
+                                Reading other configurations' outputs through
+                                terraform_remote_state is unaffected: that goes
+                                through the read-only state role.
 
     Set in consumers.auto.tfvars.
   EOT
@@ -190,7 +209,33 @@ variable "github_oidc_consumers" {
     manages_account_baseline = optional(bool, false)
     manages_github           = optional(bool, false)
     reviewer_team            = optional(string)
+    plan_parameter_paths     = optional(list(string), [])
+    plan_object_buckets      = optional(list(string), [])
   })))
+
+  # Each becomes an ARN in the read role's deny exception, so a malformed one
+  # silently excepts nothing (or, with a wildcard in the middle, too much).
+  validation {
+    condition = alltrue(flatten([
+      for account, consumers in var.github_oidc_consumers : [
+        for repo, consumer in consumers : [
+          for p in consumer.plan_parameter_paths : can(regex("^/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*(/\\*)?$", p))
+        ]
+      ]
+    ]))
+    error_message = "Every plan_parameter_paths entry must be an SSM parameter path starting with \"/\" (letters, digits, _ . -), optionally ending in /*: no other wildcard."
+  }
+
+  validation {
+    condition = alltrue(flatten([
+      for account, consumers in var.github_oidc_consumers : [
+        for repo, consumer in consumers : [
+          for b in consumer.plan_object_buckets : can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", b))
+        ]
+      ]
+    ]))
+    error_message = "Every plan_object_buckets entry must be an S3 bucket name (3 to 63 lowercase letters, digits, dots and hyphens): no wildcard, no ARN."
+  }
 
   # The same slug form as github_environment_reviewer_team: a team's display
   # name is not found.
@@ -249,6 +294,19 @@ variable "github_oidc_consumers" {
   validation {
     condition     = length(distinct([for account in keys(var.github_oidc_consumers) : upper(replace(account, "-", "_"))])) == length(var.github_oidc_consumers)
     error_message = "Two github_oidc_consumers account keys give the same <ACCOUNT>_READ_ROLE_ARN name once upper-cased with \"-\" as \"_\" (foo-bar and foo_bar). Rename one."
+  }
+
+  # And that name must be one GitHub accepts: letters, digits and "_", not
+  # starting with a digit or with GITHUB_ (checked on the whole name: the key
+  # github alone becomes GITHUB_READ_ROLE_ARN). GitHub refuses anything else only
+  # when the variable is written, part-way through an apply that has already
+  # changed the roles. dev.eu, 1-dev and github all pass the check above.
+  validation {
+    condition = alltrue([
+      for account in keys(var.github_oidc_consumers) :
+      can(regex("^[A-Z_][A-Z0-9_]*$", upper(replace(account, "-", "_")))) && !startswith("${upper(replace(account, "-", "_"))}_READ_ROLE_ARN", "GITHUB_")
+    ])
+    error_message = "Each github_oidc_consumers account key names a GitHub Actions variable, <ACCOUNT>_READ_ROLE_ARN (upper-cased, \"-\" as \"_\"), so it may hold only letters, digits, \"-\" and \"_\", may not start with a digit, and may not be github or start with github- or github_ (GitHub reserves the GITHUB_ prefix). Rejected: ${join(", ", sort([for account in keys(var.github_oidc_consumers) : account if !(can(regex("^[A-Z_][A-Z0-9_]*$", upper(replace(account, "-", "_")))) && !startswith("${upper(replace(account, "-", "_"))}_READ_ROLE_ARN", "GITHUB_"))]))}."
   }
 
   # A repository's Environment holds that account's DEPLOY_ROLE_ARN and
@@ -586,12 +644,14 @@ variable "permission_boundaries" {
     named <namespace>-<application>-<class> from the label (omron-shared-deploy,
     …), the same name in every account of that application, so an Identity
     Center permission set can reference the users class by name and path.
-    Empty (the default) renders none.
 
-    When set, it must carry the classes the federation's roles use (deploy,
-    read and service), and those must cover every consumer's services in every
-    account: deploy <svc>:*, read <svc>:Get*, List* and Describe*. A consumer
-    that adds a service needs it in aws-organization's classes first.
+    Required, with at least the classes the federation's roles use (deploy,
+    read and service): without them the consumers' roles, and the roles they
+    create under /services/<repo>/, would carry no boundary, so a consumer
+    could run a service as a role with any policy it attaches. They must cover
+    every consumer's services in every account: deploy <svc>:*, read <svc>:Get*,
+    List* and Describe*. A consumer that adds a service needs it in
+    aws-organization's classes first.
   EOT
   type = map(object({
     allow_all                 = optional(bool, false)
@@ -601,11 +661,10 @@ variable "permission_boundaries" {
     permit_human_user_actions = optional(bool, false)
     permit_org_governance     = optional(bool, false)
   }))
-  default  = {}
   nullable = false
 
   validation {
-    condition     = length(var.permission_boundaries) == 0 || length(setsubtract(["deploy", "read", "service"], keys(var.permission_boundaries))) == 0
+    condition     = length(setsubtract(["deploy", "read", "service"], keys(var.permission_boundaries))) == 0
     error_message = "permission_boundaries must carry the deploy, read and service classes (missing: ${join(", ", setsubtract(["deploy", "read", "service"], keys(var.permission_boundaries)))}): the consumers' deploy and read roles and the roles they create under /services/<repo>/ are bounded by them."
   }
 

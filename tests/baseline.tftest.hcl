@@ -126,6 +126,15 @@ variables {
   account_key = "cicd"
   account_id  = "123456789012"
 
+  # Required: the classes every run plans with unless it sets its own.
+  # allow_all keeps them out of the way of what a run tests; the classes'
+  # content and coverage are tested in the boundary runs further down.
+  permission_boundaries = {
+    deploy  = { allow_all = true, permit_policy_mutation = true }
+    read    = { allow_all = true }
+    service = { allowed_actions = ["s3:GetObject"] }
+  }
+
   # shared-workload's account label: omron-shared-cicd.
   label_context = {
     namespace          = "omron"
@@ -402,6 +411,66 @@ run "account_keys_that_name_the_same_read_role_variable_are_rejected" {
   }
 
   expect_failures = [var.github_oidc_consumers]
+}
+
+# Each account key names <ACCOUNT>_READ_ROLE_ARN, and GitHub refuses a
+# variable name with anything but letters, digits and "_", one starting with a
+# digit, or one starting with GITHUB_. One run per rule.
+run "an_account_key_with_a_dot_is_rejected" {
+  command = plan
+
+  variables {
+    github_oidc_consumers = {
+      cicd     = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+      "dev.eu" = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+    }
+  }
+
+  expect_failures = [var.github_oidc_consumers]
+}
+
+run "an_account_key_starting_with_a_digit_is_rejected" {
+  command = plan
+
+  variables {
+    github_oidc_consumers = {
+      cicd    = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+      "1-dev" = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+    }
+  }
+
+  expect_failures = [var.github_oidc_consumers]
+}
+
+run "an_account_key_github_is_rejected" {
+  command = plan
+
+  variables {
+    github_oidc_consumers = {
+      cicd   = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+      github = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+    }
+  }
+
+  expect_failures = [var.github_oidc_consumers]
+}
+
+# The stage-and-region keys connect-one-workload uses pass.
+run "stage_and_region_account_keys_are_accepted" {
+  command = plan
+
+  variables {
+    github_oidc_consumers = {
+      cicd     = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+      "dev-eu" = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+      prd_us   = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+    }
+  }
+
+  assert {
+    condition     = contains(keys(output.github_actions_settings["shared-workload"].repository_variables), "CICD_READ_ROLE_ARN")
+    error_message = "The cicd workspace still publishes its read role's variable."
+  }
 }
 
 run "the_same_environment_in_two_accounts_is_rejected" {
@@ -1088,6 +1157,150 @@ run "every_read_role_is_denied_dynamodb_data_reads" {
   }
 }
 
+# CLF-145. A pull request can assume the read role, so no read role reads a
+# parameter's value or an object's contents outside what is its own: nothing
+# by default, plus AWS's public ones. The deny must leave the hop to the
+# read-only state role alone: that session is how a plan reads other
+# configurations' outputs (terraform_remote_state).
+run "every_read_role_is_denied_parameter_and_object_reads_outside_its_own" {
+  command = plan
+
+  assert {
+    condition = alltrue([
+      for repo in keys(local.consumers) :
+      length([
+        for s in data.aws_iam_policy_document.cicd_read_permissions[repo].statement : s
+        if s.sid == "denyParameterAndObjectReadsOutsideOwn" && s.effect == "Deny"
+        && toset(s.actions) == toset(["ssm:GetParameter", "ssm:GetParameterHistory", "ssm:GetParameters", "s3:GetObject", "s3:GetObjectTorrent", "s3:GetObjectVersion", "s3:GetObjectVersionTorrent"])
+        && toset(s.not_resources) == toset(["arn:aws:ssm:*::parameter/aws/service/*"])
+      ]) == 1
+      && length([
+        for s in data.aws_iam_policy_document.cicd_read_permissions[repo].statement : s
+        if s.sid == "denyParameterTreeReadsOutsideOwnSubtrees" && s.effect == "Deny"
+        && toset(s.actions) == toset(["ssm:GetParametersByPath"])
+        && toset(s.not_resources) == toset(["arn:aws:ssm:*::parameter/aws/service", "arn:aws:ssm:*::parameter/aws/service/*"])
+      ]) == 1
+    ])
+    error_message = "By default every read role is denied every parameter value, object's contents and parameter tree but AWS's public ones."
+  }
+
+  # Only content reads are denied: the object metadata reads and the
+  # bucket-level GetObjectLockConfiguration stay readable for a plan. No
+  # read-role deny names them, by name or by an s3:GetObject* wildcard.
+  assert {
+    condition = alltrue(flatten([
+      for repo in keys(local.consumers) : [
+        for s in data.aws_iam_policy_document.cicd_read_permissions[repo].statement : [
+          for a in s.actions : !contains(["s3:getobject*", "s3:get*", "s3:*", "*", "s3:getobjectlockconfiguration", "s3:getobjecttagging", "s3:getobjectacl"], lower(a))
+        ] if s.effect == "Deny"
+      ]
+    ]))
+    error_message = "No read-role deny may name s3:GetObjectLockConfiguration or the object metadata reads, directly or by a wildcard: a plan refreshes them."
+  }
+
+  assert {
+    condition = alltrue([
+      for repo in keys(local.consumers) : alltrue([
+        for s in data.aws_iam_policy_document.cicd_read_permissions[repo].statement :
+        !anytrue([for a in s.actions : startswith(a, "sts:")]) if s.effect == "Deny"
+      ])
+    ]) && length(data.aws_iam_policy_document.cicd_assume_read_state) == 1 && length(aws_iam_role_policy.cicd_read_assume_state_access) == length(local.consumers)
+    error_message = "No read-role deny touches sts:, and every read role may still assume the read-only state role, through which terraform_remote_state reads other configurations' outputs."
+  }
+}
+
+run "declared_parameter_paths_and_buckets_replace_the_default_exception" {
+  command = plan
+
+  variables {
+    github_oidc_consumers = {
+      cicd = {
+        "shared-workload" = { manages_account_baseline = true, services = [], workspaces = ["cicd"], manages_github = true }
+        "shared-terraform-registry" = {
+          services             = ["s3", "ssm"]
+          plan_parameter_paths = ["/shared-terraform-registry/*", "/platform/config"]
+          plan_object_buckets  = ["omron-registry-modules"]
+        }
+      }
+    }
+  }
+
+  assert {
+    condition = length([
+      for s in data.aws_iam_policy_document.cicd_read_permissions["shared-terraform-registry"].statement : s
+      if s.sid == "denyParameterAndObjectReadsOutsideOwn" && toset(s.not_resources) == toset([
+        "arn:aws:ssm:*::parameter/aws/service/*",
+        "arn:aws:ssm:*:123456789012:parameter/shared-terraform-registry/*",
+        "arn:aws:ssm:*:123456789012:parameter/platform/config",
+        "arn:aws:s3:::omron-registry-modules/*",
+      ])
+    ]) == 1
+    error_message = "Each declared path's values and each declared bucket's objects are excepted."
+  }
+
+  # GetParametersByPath is authorized against the path and returns everything
+  # below it, so only the declared subtree opens it (on its root and below).
+  # The exact /platform/config must not: a recursive call on it would return
+  # /platform/config/password.
+  assert {
+    condition = length([
+      for s in data.aws_iam_policy_document.cicd_read_permissions["shared-terraform-registry"].statement : s
+      if s.sid == "denyParameterTreeReadsOutsideOwnSubtrees" && toset(s.not_resources) == toset([
+        "arn:aws:ssm:*::parameter/aws/service",
+        "arn:aws:ssm:*::parameter/aws/service/*",
+        "arn:aws:ssm:*:123456789012:parameter/shared-terraform-registry",
+        "arn:aws:ssm:*:123456789012:parameter/shared-terraform-registry/*",
+      ])
+    ]) == 1
+    error_message = "Only a declared subtree may be listed with GetParametersByPath: an exact path must not open its descendants."
+  }
+}
+
+run "a_parameter_path_without_a_leading_slash_is_rejected" {
+  command = plan
+
+  variables {
+    github_oidc_consumers = {
+      cicd = {
+        "shared-workload"           = { manages_account_baseline = true, services = [] }
+        "shared-terraform-registry" = { services = ["ssm"], plan_parameter_paths = ["shared-terraform-registry/*"] }
+      }
+    }
+  }
+
+  expect_failures = [var.github_oidc_consumers]
+}
+
+run "a_parameter_path_with_a_wildcard_inside_is_rejected" {
+  command = plan
+
+  variables {
+    github_oidc_consumers = {
+      cicd = {
+        "shared-workload"           = { manages_account_baseline = true, services = [] }
+        "shared-terraform-registry" = { services = ["ssm"], plan_parameter_paths = ["/*/config"] }
+      }
+    }
+  }
+
+  expect_failures = [var.github_oidc_consumers]
+}
+
+run "a_bucket_given_as_an_arn_is_rejected" {
+  command = plan
+
+  variables {
+    github_oidc_consumers = {
+      cicd = {
+        "shared-workload"           = { manages_account_baseline = true, services = [] }
+        "shared-terraform-registry" = { services = ["s3"], plan_object_buckets = ["arn:aws:s3:::omron-registry-modules"] }
+      }
+    }
+  }
+
+  expect_failures = [var.github_oidc_consumers]
+}
+
 run "github_app_keys_go_to_manages_github_repositories_only" {
   command = plan
 
@@ -1311,6 +1524,35 @@ run "a_wildcard_github_app_key_secret_is_rejected" {
 # only known once applied, and so is the comparison.
 run "github_variables_are_managed_from_the_settings" {
   command = apply
+
+  # The classes are required (CLF-144), but this run is not about them. Left
+  # to the mock, an apply would create the class policies, and the mock gives
+  # their id, name_prefix and policy_id new values between plan and apply,
+  # which Terraform refuses as an inconsistent final plan. One class that
+  # allows everything stands in for each; the boundary runs test the real
+  # ones with command = plan.
+  override_module {
+    target = module.permission_boundary
+    outputs = {
+      policy_arn           = "arn:aws:iam::123456789012:policy/boundaries/omron-shared-class"
+      policy_name          = "omron-shared-class"
+      policy_path          = "/boundaries/"
+      policy_document_json = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}]}"
+      policy_statements    = [{ sid = "allowAll", effect = "Allow", actions = ["*"], resources = ["*"] }]
+    }
+  }
+
+  # The baseline's own boundary, the same way.
+  override_resource {
+    target          = aws_iam_policy.baseline_boundary
+    override_during = plan
+    values = {
+      arn         = "arn:aws:iam::123456789012:policy/boundaries/shared-workload-baseline"
+      id          = "arn:aws:iam::123456789012:policy/boundaries/shared-workload-baseline"
+      name_prefix = ""
+      policy_id   = "ANPAMOCKEDBASELINE0000"
+    }
+  }
 
   # An apply would run the workspace-creation script for real (see the
   # file-level variables): without the provisioner nothing is created, and
@@ -1812,6 +2054,35 @@ run "the_declared_workspaces_are_published_and_planned" {
 run "a_declared_workspace_is_recorded" {
   command = apply
 
+  # The classes are required (CLF-144), but this run is not about them. Left
+  # to the mock, an apply would create the class policies, and the mock gives
+  # their id, name_prefix and policy_id new values between plan and apply,
+  # which Terraform refuses as an inconsistent final plan. One class that
+  # allows everything stands in for each; the boundary runs test the real
+  # ones with command = plan.
+  override_module {
+    target = module.permission_boundary
+    outputs = {
+      policy_arn           = "arn:aws:iam::123456789012:policy/boundaries/omron-shared-class"
+      policy_name          = "omron-shared-class"
+      policy_path          = "/boundaries/"
+      policy_document_json = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}]}"
+      policy_statements    = [{ sid = "allowAll", effect = "Allow", actions = ["*"], resources = ["*"] }]
+    }
+  }
+
+  # The baseline's own boundary, the same way.
+  override_resource {
+    target          = aws_iam_policy.baseline_boundary
+    override_during = plan
+    values = {
+      arn         = "arn:aws:iam::123456789012:policy/boundaries/shared-workload-baseline"
+      id          = "arn:aws:iam::123456789012:policy/boundaries/shared-workload-baseline"
+      name_prefix = ""
+      policy_id   = "ANPAMOCKEDBASELINE0000"
+    }
+  }
+
   variables {
     create_workspace_states = false
     github_oidc_consumers = {
@@ -1830,6 +2101,35 @@ run "a_declared_workspace_is_recorded" {
 
 run "removing_a_declared_workspace_only_drops_its_record" {
   command = apply
+
+  # The classes are required (CLF-144), but this run is not about them. Left
+  # to the mock, an apply would create the class policies, and the mock gives
+  # their id, name_prefix and policy_id new values between plan and apply,
+  # which Terraform refuses as an inconsistent final plan. One class that
+  # allows everything stands in for each; the boundary runs test the real
+  # ones with command = plan.
+  override_module {
+    target = module.permission_boundary
+    outputs = {
+      policy_arn           = "arn:aws:iam::123456789012:policy/boundaries/omron-shared-class"
+      policy_name          = "omron-shared-class"
+      policy_path          = "/boundaries/"
+      policy_document_json = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}]}"
+      policy_statements    = [{ sid = "allowAll", effect = "Allow", actions = ["*"], resources = ["*"] }]
+    }
+  }
+
+  # The baseline's own boundary, the same way.
+  override_resource {
+    target          = aws_iam_policy.baseline_boundary
+    override_during = plan
+    values = {
+      arn         = "arn:aws:iam::123456789012:policy/boundaries/shared-workload-baseline"
+      id          = "arn:aws:iam::123456789012:policy/boundaries/shared-workload-baseline"
+      name_prefix = ""
+      policy_id   = "ANPAMOCKEDBASELINE0000"
+    }
+  }
 
   variables {
     create_workspace_states = false
@@ -1918,13 +2218,16 @@ run "a_reviewer_team_display_name_on_a_consumer_is_rejected" {
 # module's, tested in its own directory; here the classes are counted, keyed
 # and checked against the consumers.
 
-run "without_classes_no_boundary_is_rendered" {
+# No classes is no longer a way to run: every role would be unbounded
+# (CLF-144).
+run "empty_permission_boundaries_are_rejected" {
   command = plan
 
-  assert {
-    condition     = length(output.permission_boundary_arns) == 0
-    error_message = "With no permission_boundaries (the default), no boundary policy is rendered."
+  variables {
+    permission_boundaries = {}
   }
+
+  expect_failures = [var.permission_boundaries]
 }
 
 # The classes cover everything the roles' own policies grant, services and the
@@ -2125,26 +2428,6 @@ override_resource {
   target          = aws_iam_policy.baseline_boundary
   override_during = plan
   values          = { arn = "arn:aws:iam::123456789012:policy/boundaries/shared-workload-baseline" }
-}
-
-run "without_classes_no_role_carries_a_boundary" {
-  command = plan
-
-  assert {
-    condition = alltrue(concat(
-      [for role in aws_iam_role.cicd_deploy : role.permissions_boundary == null],
-      [for role in aws_iam_role.cicd_read : role.permissions_boundary == null],
-    )) && length(aws_iam_policy.baseline_boundary) == 0
-    error_message = "With no classes given, no role carries a boundary and no baseline boundary is rendered."
-  }
-
-  assert {
-    condition = alltrue([
-      for s in data.aws_iam_policy_document.cicd_deploy_permissions["shared-cicd-infrastructure"].statement :
-      length(s.condition) == 0 if s.sid == "iamCreateOwnedRole"
-    ])
-    error_message = "With no classes given, iam:CreateRole carries no boundary condition."
-  }
 }
 
 run "with_classes_every_role_carries_its_boundary" {
@@ -2390,24 +2673,6 @@ run "without_account_resources_nothing_account_wide_is_created" {
   assert {
     condition     = length(terraform_data.permission_boundary_coverage) == 1
     error_message = "Without manage_account_resources, the classes are still rendered, so the coverage check still holds for this workspace's roles."
-  }
-}
-
-run "without_account_resources_or_classes_no_boundary_is_read" {
-  command = plan
-
-  variables {
-    manage_account_resources = false
-  }
-
-  assert {
-    condition     = length(data.aws_iam_policy.class_boundary) == 0 && length(data.aws_iam_policy.baseline_boundary) == 0
-    error_message = "Without classes, no boundary policy is read either."
-  }
-
-  assert {
-    condition     = length(data.aws_iam_openid_connect_provider.github) == 1
-    error_message = "Without manage_account_resources, the provider is read even without classes."
   }
 }
 
@@ -2674,6 +2939,13 @@ run "a_stage_without_account_resources_rejects_an_owner_boundary_without_the_pat
     values = { policy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"denyChangingOwnBoundary\",\"Effect\":\"Deny\",\"Action\":[\"iam:PutRolePermissionsBoundary\",\"iam:DeleteRolePermissionsBoundary\"],\"Resource\":\"arn:aws:iam::123456789012:role/cicd/gha/shared-workload-deploy\"}]}" }
   }
 
+  # This workspace's rendering stands in for the same document, so only the
+  # pattern check fails, not the comparison with the owner's.
+  override_data {
+    target = data.aws_iam_policy_document.baseline_boundary
+    values = { json = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"denyChangingOwnBoundary\",\"Effect\":\"Deny\",\"Action\":[\"iam:PutRolePermissionsBoundary\",\"iam:DeleteRolePermissionsBoundary\"],\"Resource\":\"arn:aws:iam::123456789012:role/cicd/gha/shared-workload-deploy\"}]}" }
+  }
+
   expect_failures = [terraform_data.stage_baseline_prefix]
 }
 
@@ -2697,10 +2969,45 @@ run "a_stage_without_account_resources_accepts_an_owner_boundary_with_the_patter
     values = { policy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"denyChangingOwnBoundary\",\"Effect\":\"Deny\",\"Action\":[\"iam:PutRolePermissionsBoundary\",\"iam:DeleteRolePermissionsBoundary\"],\"Resource\":[\"arn:aws:iam::123456789012:role/cicd/gha/shared-workload-deploy\",\"arn:aws:iam::123456789012:role/cicd/gha/shared-workload-*-deploy\"]}]}" }
   }
 
+  # And this workspace renders the same document.
+  override_data {
+    target = data.aws_iam_policy_document.baseline_boundary
+    values = { json = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"denyChangingOwnBoundary\",\"Effect\":\"Deny\",\"Action\":[\"iam:PutRolePermissionsBoundary\",\"iam:DeleteRolePermissionsBoundary\"],\"Resource\":[\"arn:aws:iam::123456789012:role/cicd/gha/shared-workload-deploy\",\"arn:aws:iam::123456789012:role/cicd/gha/shared-workload-*-deploy\"]}]}" }
+  }
+
   assert {
     condition     = aws_iam_role.cicd_deploy["shared-workload"].name == "shared-workload-qa-deploy" && aws_iam_role.cicd_deploy["shared-workload"].permissions_boundary == "arn:aws:iam::123456789012:policy/boundaries/shared-workload-baseline"
     error_message = "This stage's baseline deploy role carries the owner's baseline boundary."
   }
+}
+
+# A stage whose baseline entry differs from the owner's: here a service only
+# this workspace declares, so its rendering of the baseline boundary isn't the
+# policy the owner applied. Its baseline deploy role would carry a boundary
+# that doesn't allow that service. Review on #2 (CLF-146).
+run "a_stage_without_account_resources_rejects_an_owner_baseline_boundary_that_differs" {
+  command = plan
+
+  variables {
+    stage                    = "qa"
+    manage_account_resources = false
+    permission_boundaries = {
+      deploy  = { allow_all = true, permit_policy_mutation = true }
+      read    = { allow_all = true }
+      service = { allowed_actions = ["s3:GetObject"], denied_actions = ["sts:AssumeRole"] }
+      users   = { allow_all = true, denied_actions = ["iam:PassRole"] }
+    }
+  }
+
+  # The owner's policy: rendered without the logs service this workspace's
+  # baseline entry declares. The mocked rendering here is the provider's
+  # default document, so any other policy stands for that difference.
+  override_data {
+    target = data.aws_iam_policy.baseline_boundary
+    values = { policy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"denyChangingOwnBoundary\",\"Effect\":\"Deny\",\"Action\":[\"iam:PutRolePermissionsBoundary\",\"iam:DeleteRolePermissionsBoundary\"],\"Resource\":[\"arn:aws:iam::123456789012:role/cicd/gha/shared-workload-deploy\",\"arn:aws:iam::123456789012:role/cicd/gha/shared-workload-*-deploy\"]}]}" }
+  }
+
+  expect_failures = [data.aws_iam_policy.baseline_boundary]
 }
 
 run "a_stage_that_pushes_a_role_name_past_64_characters_is_rejected" {
