@@ -179,8 +179,12 @@ variable "github_oidc_consumers" {
                                 repository's read role may read (a plan
                                 refreshing an aws_ssm_parameter decrypts it).
                                 IAM patterns starting with "/", "*" only at the
-                                end. Defaults to ["/<repo>", "/<repo>/*"]; AWS's
-                                public /aws/service/* is always readable. Every
+                                end. Defaults to none, like plan_object_buckets;
+                                AWS's public /aws/service/* is always readable.
+                                Only a subtree ("<path>/*") also opens
+                                GetParametersByPath, on <path> and below: an
+                                exact path never does, since a recursive call on
+                                it would return everything under it. Every
                                 other parameter's value is denied
                                 (github-oidc-role-read.tf, CLF-145).
       plan_object_buckets       The S3 buckets whose objects this repository's
@@ -203,7 +207,7 @@ variable "github_oidc_consumers" {
     manages_account_baseline = optional(bool, false)
     manages_github           = optional(bool, false)
     reviewer_team            = optional(string)
-    plan_parameter_paths     = optional(list(string))
+    plan_parameter_paths     = optional(list(string), [])
     plan_object_buckets      = optional(list(string), [])
   })))
 
@@ -213,7 +217,7 @@ variable "github_oidc_consumers" {
     condition = alltrue(flatten([
       for account, consumers in var.github_oidc_consumers : [
         for repo, consumer in consumers : [
-          for p in coalesce(consumer.plan_parameter_paths, []) : can(regex("^/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*(/\\*)?$", p))
+          for p in consumer.plan_parameter_paths : can(regex("^/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*(/\\*)?$", p))
         ]
       ]
     ]))
