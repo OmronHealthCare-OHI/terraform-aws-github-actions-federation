@@ -29,6 +29,38 @@ locals {
     for repo in keys(local.consumers) :
     repo => "${local.github_oidc_subject_prefix[repo]}:*"
   }
+
+  # Per repository: the parameters and objects its read role may read the
+  # values of (denyParameterAndObjectReadsOutsideOwn below). A parameter named
+  # /<path> has the ARN parameter/<path>. Nothing of its own by default, like
+  # the buckets: a repository declares what its plan refreshes.
+  read_role_payload_resources = {
+    for repo, consumer in local.consumers : repo => concat(
+      ["arn:aws:ssm:*::parameter/aws/service/*"],
+      [for p in consumer.plan_parameter_paths : "arn:aws:ssm:*:${var.account_id}:parameter${p}"],
+      [for b in consumer.plan_object_buckets : "arn:aws:s3:::${b}/*"],
+    )
+  }
+
+  # Per repository: the paths its read role may list with values
+  # (denyParameterTreeReadsOutsideOwnSubtrees below). GetParametersByPath is
+  # authorized against the requested path alone, and a recursive call returns
+  # every parameter below it, even one the caller is denied (SSM user guide,
+  # GetParametersByPath). So only a declared subtree, "<path>/*", opens it: on
+  # the subtree's paths and on <path> itself, whose descendants are exactly
+  # that subtree. An exact path never does, or "/platform/config" would expose
+  # "/platform/config/password".
+  read_role_parameter_tree_resources = {
+    for repo, consumer in local.consumers : repo => concat(
+      ["arn:aws:ssm:*::parameter/aws/service", "arn:aws:ssm:*::parameter/aws/service/*"],
+      flatten([
+        for p in consumer.plan_parameter_paths : [
+          "arn:aws:ssm:*:${var.account_id}:parameter${trimsuffix(p, "/*")}",
+          "arn:aws:ssm:*:${var.account_id}:parameter${p}",
+        ] if endswith(p, "/*")
+      ]),
+    )
+  }
 }
 
 data "aws_iam_policy_document" "cicd_read_assume_role" {
@@ -174,6 +206,49 @@ data "aws_iam_policy_document" "cicd_read_permissions" {
       "dynamodb:Scan",
     ]
     resources = ["*"]
+  }
+
+  # Likewise a parameter's value and an object's contents: ssm:Get* and s3:Get*
+  # above admit GetParameter (decrypting SecureStrings, whichever key encrypts
+  # them) and GetObject, on every parameter and object in the account. IAM
+  # can't tell a value read from a metadata read, so the values are denied
+  # outright, except where a plan needs them: the parameter paths this
+  # repository declares (an aws_ssm_parameter refreshes with decryption), the
+  # buckets it declares (an aws_s3_object refreshes with HeadObject, which is
+  # s3:GetObject), and AWS's public parameters (AMI lookups). CLF-145.
+  #
+  # Only the actions that return contents: GetObject (HeadObject too),
+  # GetObjectVersion and their torrents. Not s3:GetObject*, which also takes
+  # GetObjectLockConfiguration, a bucket-level read whose bucket ARN no
+  # bucket/* exception can match, and the object metadata reads (tags, ACL,
+  # retention, legal hold, attributes) a plan refreshes.
+  #
+  # Other configurations' outputs stay readable: terraform_remote_state reads
+  # them through the read-only state role (the tfstate profile), a separate
+  # session this deny doesn't bind, and the state bucket's own policy already
+  # denies object reads to everyone but the state roles.
+  statement {
+    sid    = "denyParameterAndObjectReadsOutsideOwn"
+    effect = "Deny"
+    actions = [
+      "ssm:GetParameter",
+      "ssm:GetParameterHistory",
+      "ssm:GetParameters",
+      "s3:GetObject",
+      "s3:GetObjectTorrent",
+      "s3:GetObjectVersion",
+      "s3:GetObjectVersionTorrent",
+    ]
+    not_resources = local.read_role_payload_resources[each.key]
+  }
+
+  # GetParametersByPath on its own: it is authorized against the path, so its
+  # exceptions are the declared subtrees only (read_role_parameter_tree_resources).
+  statement {
+    sid           = "denyParameterTreeReadsOutsideOwnSubtrees"
+    effect        = "Deny"
+    actions       = ["ssm:GetParametersByPath"]
+    not_resources = local.read_role_parameter_tree_resources[each.key]
   }
 
   # Permission boundaries are created, changed and deleted by this repository

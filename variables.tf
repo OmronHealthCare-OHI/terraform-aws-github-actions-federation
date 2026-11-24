@@ -175,6 +175,25 @@ variable "github_oidc_consumers" {
                                 repository's Environments require, and which
                                 gets access to it (github-team-access.tf).
                                 Defaults to github_environment_reviewer_team.
+      plan_parameter_paths      The SSM parameter paths whose values this
+                                repository's read role may read (a plan
+                                refreshing an aws_ssm_parameter decrypts it).
+                                IAM patterns starting with "/", "*" only at the
+                                end. Defaults to none, like plan_object_buckets;
+                                AWS's public /aws/service/* is always readable.
+                                Only a subtree ("<path>/*") also opens
+                                GetParametersByPath, on <path> and below: an
+                                exact path never does, since a recursive call on
+                                it would return everything under it. Every
+                                other parameter's value is denied
+                                (github-oidc-role-read.tf, CLF-145).
+      plan_object_buckets       The S3 buckets whose objects this repository's
+                                read role may read (a plan refreshing an
+                                aws_s3_object needs s3:GetObject), by name.
+                                Defaults to none: every other object is denied.
+                                Reading other configurations' outputs through
+                                terraform_remote_state is unaffected: that goes
+                                through the read-only state role.
 
     Set in consumers.auto.tfvars.
   EOT
@@ -188,7 +207,33 @@ variable "github_oidc_consumers" {
     manages_account_baseline = optional(bool, false)
     manages_github           = optional(bool, false)
     reviewer_team            = optional(string)
+    plan_parameter_paths     = optional(list(string), [])
+    plan_object_buckets      = optional(list(string), [])
   })))
+
+  # Each becomes an ARN in the read role's deny exception, so a malformed one
+  # silently excepts nothing (or, with a wildcard in the middle, too much).
+  validation {
+    condition = alltrue(flatten([
+      for account, consumers in var.github_oidc_consumers : [
+        for repo, consumer in consumers : [
+          for p in consumer.plan_parameter_paths : can(regex("^/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*(/\\*)?$", p))
+        ]
+      ]
+    ]))
+    error_message = "Every plan_parameter_paths entry must be an SSM parameter path starting with \"/\" (letters, digits, _ . -), optionally ending in /*: no other wildcard."
+  }
+
+  validation {
+    condition = alltrue(flatten([
+      for account, consumers in var.github_oidc_consumers : [
+        for repo, consumer in consumers : [
+          for b in consumer.plan_object_buckets : can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", b))
+        ]
+      ]
+    ]))
+    error_message = "Every plan_object_buckets entry must be an S3 bucket name (3 to 63 lowercase letters, digits, dots and hyphens): no wildcard, no ARN."
+  }
 
   # The same slug form as github_environment_reviewer_team: a team's display
   # name is not found.

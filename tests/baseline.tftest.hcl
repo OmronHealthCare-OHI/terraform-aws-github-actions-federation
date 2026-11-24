@@ -1137,6 +1137,150 @@ run "every_read_role_is_denied_dynamodb_data_reads" {
   }
 }
 
+# CLF-145. A pull request can assume the read role, so no read role reads a
+# parameter's value or an object's contents outside what is its own: nothing
+# by default, plus AWS's public ones. The deny must leave the hop to the
+# read-only state role alone: that session is how a plan reads other
+# configurations' outputs (terraform_remote_state).
+run "every_read_role_is_denied_parameter_and_object_reads_outside_its_own" {
+  command = plan
+
+  assert {
+    condition = alltrue([
+      for repo in keys(local.consumers) :
+      length([
+        for s in data.aws_iam_policy_document.cicd_read_permissions[repo].statement : s
+        if s.sid == "denyParameterAndObjectReadsOutsideOwn" && s.effect == "Deny"
+        && toset(s.actions) == toset(["ssm:GetParameter", "ssm:GetParameterHistory", "ssm:GetParameters", "s3:GetObject", "s3:GetObjectTorrent", "s3:GetObjectVersion", "s3:GetObjectVersionTorrent"])
+        && toset(s.not_resources) == toset(["arn:aws:ssm:*::parameter/aws/service/*"])
+      ]) == 1
+      && length([
+        for s in data.aws_iam_policy_document.cicd_read_permissions[repo].statement : s
+        if s.sid == "denyParameterTreeReadsOutsideOwnSubtrees" && s.effect == "Deny"
+        && toset(s.actions) == toset(["ssm:GetParametersByPath"])
+        && toset(s.not_resources) == toset(["arn:aws:ssm:*::parameter/aws/service", "arn:aws:ssm:*::parameter/aws/service/*"])
+      ]) == 1
+    ])
+    error_message = "By default every read role is denied every parameter value, object's contents and parameter tree but AWS's public ones."
+  }
+
+  # Only content reads are denied: the object metadata reads and the
+  # bucket-level GetObjectLockConfiguration stay readable for a plan. No
+  # read-role deny names them, by name or by an s3:GetObject* wildcard.
+  assert {
+    condition = alltrue(flatten([
+      for repo in keys(local.consumers) : [
+        for s in data.aws_iam_policy_document.cicd_read_permissions[repo].statement : [
+          for a in s.actions : !contains(["s3:getobject*", "s3:get*", "s3:*", "*", "s3:getobjectlockconfiguration", "s3:getobjecttagging", "s3:getobjectacl"], lower(a))
+        ] if s.effect == "Deny"
+      ]
+    ]))
+    error_message = "No read-role deny may name s3:GetObjectLockConfiguration or the object metadata reads, directly or by a wildcard: a plan refreshes them."
+  }
+
+  assert {
+    condition = alltrue([
+      for repo in keys(local.consumers) : alltrue([
+        for s in data.aws_iam_policy_document.cicd_read_permissions[repo].statement :
+        !anytrue([for a in s.actions : startswith(a, "sts:")]) if s.effect == "Deny"
+      ])
+    ]) && length(data.aws_iam_policy_document.cicd_assume_read_state) == 1 && length(aws_iam_role_policy.cicd_read_assume_state_access) == length(local.consumers)
+    error_message = "No read-role deny touches sts:, and every read role may still assume the read-only state role, through which terraform_remote_state reads other configurations' outputs."
+  }
+}
+
+run "declared_parameter_paths_and_buckets_replace_the_default_exception" {
+  command = plan
+
+  variables {
+    github_oidc_consumers = {
+      cicd = {
+        "shared-workload" = { manages_account_baseline = true, services = [], workspaces = ["cicd"], manages_github = true }
+        "shared-terraform-registry" = {
+          services             = ["s3", "ssm"]
+          plan_parameter_paths = ["/shared-terraform-registry/*", "/platform/config"]
+          plan_object_buckets  = ["omron-registry-modules"]
+        }
+      }
+    }
+  }
+
+  assert {
+    condition = length([
+      for s in data.aws_iam_policy_document.cicd_read_permissions["shared-terraform-registry"].statement : s
+      if s.sid == "denyParameterAndObjectReadsOutsideOwn" && toset(s.not_resources) == toset([
+        "arn:aws:ssm:*::parameter/aws/service/*",
+        "arn:aws:ssm:*:123456789012:parameter/shared-terraform-registry/*",
+        "arn:aws:ssm:*:123456789012:parameter/platform/config",
+        "arn:aws:s3:::omron-registry-modules/*",
+      ])
+    ]) == 1
+    error_message = "Each declared path's values and each declared bucket's objects are excepted."
+  }
+
+  # GetParametersByPath is authorized against the path and returns everything
+  # below it, so only the declared subtree opens it (on its root and below).
+  # The exact /platform/config must not: a recursive call on it would return
+  # /platform/config/password.
+  assert {
+    condition = length([
+      for s in data.aws_iam_policy_document.cicd_read_permissions["shared-terraform-registry"].statement : s
+      if s.sid == "denyParameterTreeReadsOutsideOwnSubtrees" && toset(s.not_resources) == toset([
+        "arn:aws:ssm:*::parameter/aws/service",
+        "arn:aws:ssm:*::parameter/aws/service/*",
+        "arn:aws:ssm:*:123456789012:parameter/shared-terraform-registry",
+        "arn:aws:ssm:*:123456789012:parameter/shared-terraform-registry/*",
+      ])
+    ]) == 1
+    error_message = "Only a declared subtree may be listed with GetParametersByPath: an exact path must not open its descendants."
+  }
+}
+
+run "a_parameter_path_without_a_leading_slash_is_rejected" {
+  command = plan
+
+  variables {
+    github_oidc_consumers = {
+      cicd = {
+        "shared-workload"           = { manages_account_baseline = true, services = [] }
+        "shared-terraform-registry" = { services = ["ssm"], plan_parameter_paths = ["shared-terraform-registry/*"] }
+      }
+    }
+  }
+
+  expect_failures = [var.github_oidc_consumers]
+}
+
+run "a_parameter_path_with_a_wildcard_inside_is_rejected" {
+  command = plan
+
+  variables {
+    github_oidc_consumers = {
+      cicd = {
+        "shared-workload"           = { manages_account_baseline = true, services = [] }
+        "shared-terraform-registry" = { services = ["ssm"], plan_parameter_paths = ["/*/config"] }
+      }
+    }
+  }
+
+  expect_failures = [var.github_oidc_consumers]
+}
+
+run "a_bucket_given_as_an_arn_is_rejected" {
+  command = plan
+
+  variables {
+    github_oidc_consumers = {
+      cicd = {
+        "shared-workload"           = { manages_account_baseline = true, services = [] }
+        "shared-terraform-registry" = { services = ["s3"], plan_object_buckets = ["arn:aws:s3:::omron-registry-modules"] }
+      }
+    }
+  }
+
+  expect_failures = [var.github_oidc_consumers]
+}
+
 run "github_app_keys_go_to_manages_github_repositories_only" {
   command = plan
 
