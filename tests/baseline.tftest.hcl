@@ -824,8 +824,6 @@ run "iam_in_services_is_rejected" {
 
 # A wildcard service renders an action pattern across every service, IAM and
 # STS included, which the exact-name exclusion cannot see.
-# GitHub encodes ":" in a context value as %3A in the sub claim; the trust
-# must match the encoded form, the settings output keeps the raw name.
 # Both trusts are built on the prefix GitHub reports, IDs included: the
 # name-only form would never match these repositories' tokens.
 run "trusts_use_the_subject_prefix_github_reports" {
@@ -917,7 +915,12 @@ run "a_prefix_for_another_repository_is_rejected" {
   expect_failures = [data.github_rest_api.oidc_subject["shared-cicd-infrastructure"]]
 }
 
-run "colon_in_environment_is_encoded_in_the_subject" {
+# GitHub writes a ":" in an Environment name as %3A in the sub claim and
+# leaves "%" alone, so production:v2 and production%3Av2 would be one trusted
+# subject, and a workflow could take the deploy role through whichever has no
+# protection. Both characters are rejected, in an environment and in an account
+# key it defaults to. Review on #2 (CLF-166).
+run "a_colon_in_environment_is_rejected" {
   command = plan
 
   variables {
@@ -929,18 +932,35 @@ run "colon_in_environment_is_encoded_in_the_subject" {
     }
   }
 
-  assert {
-    condition = one(flatten([
-      for c in data.aws_iam_policy_document.cicd_deploy_assume_role["shared-cicd-infrastructure"].statement[0].condition :
-      tolist(c.values) if c.variable == "token.actions.githubusercontent.com:sub"
-    ])) == "repo:OmronHealthCare-OHI@20930349/shared-cicd-infrastructure@1398327937:environment:production%3Av2"
-    error_message = "A colon in the Environment name must be %3A in the trusted subject, as GitHub emits it."
+  expect_failures = [var.github_oidc_consumers]
+}
+
+run "an_encoded_colon_in_environment_is_rejected" {
+  command = plan
+
+  variables {
+    github_oidc_consumers = {
+      cicd = {
+        "shared-workload"            = { manages_account_baseline = true, services = [] }
+        "shared-cicd-infrastructure" = { services = ["s3"], environment = "production%3Av2" }
+      }
+    }
   }
 
-  assert {
-    condition     = keys(output.github_actions_settings["shared-cicd-infrastructure"].environments) == ["production:v2"]
-    error_message = "The settings output names the Environment as it is configured in GitHub: raw, not encoded."
+  expect_failures = [var.github_oidc_consumers]
+}
+
+run "an_account_key_with_a_colon_is_rejected_as_a_default_environment" {
+  command = plan
+
+  variables {
+    github_oidc_consumers = {
+      cicd     = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+      "dev:eu" = { "shared-workload" = { manages_account_baseline = true, services = [] } }
+    }
   }
+
+  expect_failures = [var.github_oidc_consumers]
 }
 
 run "blank_environment_is_rejected" {
